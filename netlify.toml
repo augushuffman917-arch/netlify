@@ -1,6 +1,9 @@
 [build]
-  command = "echo 'Pure Edge Function'"
+  command = "bash ./scripts/verify-build.sh"
   publish = "public"
+
+[build.environment]
+  NODE_VERSION = "20"
 
 [[edge_functions]]
   path = "/*"
