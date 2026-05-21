@@ -1,4 +1,3 @@
-
 const FALLBACK_PAGE = "https://ir-netlify.github.io/NETLIFY/new/new.html";
 
 const BLOCKED_HEADERS = [
@@ -7,21 +6,81 @@ const BLOCKED_HEADERS = [
   "upgrade", "forwarded", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port"
 ];
 
-const constructDestUrl = (domain, path, query) => {
-  if (domain.startsWith('http://') || domain.startsWith('https://')) {
-    return `${domain}${path}${query}`;
+const METHOD_WITHOUT_BODY = new Set(["GET", "HEAD"]);
+
+const normalizeOrigin = (value) => value?.replace(/\/+$/, "") || "";
+
+const buildUrl = (origin, path, query) => {
+  if (!origin) return null;
+  if (origin.startsWith("http://") || origin.startsWith("https://")) {
+    return `${origin}${path}${query}`;
   }
-  const isHttps = !domain.includes(':') || domain.includes(':443') || /^s\d+\./.test(domain);
-  return `${isHttps ? 'https://' : 'http://'}${domain}${path}${query}`;
+  const isHttps = !origin.includes(":") || origin.includes(":443") || /^s\d+\./.test(origin);
+  return `${isHttps ? "https://" : "http://"}${origin}${path}${query}`;
 };
 
-export default async (req, ctx) => {
+const copyRequestHeaders = (req) => {
+  const headers = new Headers();
+  let forwardedFor = null;
+
+  req.headers.forEach((value, key) => {
+    const lowerKey = key.toLowerCase();
+    if (
+      BLOCKED_HEADERS.includes(lowerKey) ||
+      lowerKey.startsWith("x-nf-") ||
+      lowerKey.startsWith("x-netlify-") ||
+      lowerKey === "x-host"
+    ) {
+      return;
+    }
+
+    if (lowerKey === "x-real-ip" || lowerKey === "x-forwarded-for") {
+      if (!forwardedFor) forwardedFor = value;
+      return;
+    }
+
+    headers.set(lowerKey, value);
+  });
+
+  if (forwardedFor) headers.set("x-forwarded-for", forwardedFor);
+
+  return headers;
+};
+
+const resolveRouteMode = (req) => {
+  const mode = (Deno.env.get("PROXY_MODE") || "auto").toLowerCase();
+  if (mode === "first" || mode === "second") return mode;
+
+  if (req.headers.get("x-proxy-hop") === "project-1") return "second";
+  return "first";
+};
+
+const resolveUpstream = (mode, req) => {
+  const xHost = req.headers.get("x-host");
+
+  if (mode === "first") {
+    return normalizeOrigin(Deno.env.get("NEXT_PROJECT_URL") || xHost);
+  }
+
+  return normalizeOrigin(Deno.env.get("TARGET_ORIGIN") || xHost);
+};
+
+const setHopHeaders = (mode, headers) => {
+  if (mode === "first") {
+    headers.set("x-proxy-hop", "project-1");
+  }
+  if (mode === "second") {
+    headers.set("x-proxy-hop", "project-2");
+  }
+};
+
+export default async (req) => {
   try {
     const parsedUrl = new URL(req.url);
-    const destHost = req.headers.get("x-host");
+    const routeMode = resolveRouteMode(req);
+    const upstream = resolveUpstream(routeMode, req);
 
-    // Handle root path fallback
-    if (parsedUrl.pathname === "/" && !destHost) {
+    if (parsedUrl.pathname === "/" && !upstream) {
       const wsCheck = (req.headers.get("upgrade") || "").toLowerCase();
       if (wsCheck !== "websocket") {
         const fallbackRes = await fetch(FALLBACK_PAGE);
@@ -31,58 +90,35 @@ export default async (req, ctx) => {
       }
     }
 
-    if (!destHost) {
-      return new Response("Invalid Request: Missing target host.", { status: 400 });
+    if (!upstream) {
+      const helpText =
+        "Invalid request: missing upstream. Set NEXT_PROJECT_URL (project-1) or TARGET_ORIGIN (project-2), or send x-host.";
+      return new Response(helpText, { status: 400 });
     }
 
-    const finalUrl = constructDestUrl(destHost, parsedUrl.pathname, parsedUrl.search);
-    const proxyHeaders = new Headers();
-    let clientAddress = null;
+    const finalUrl = buildUrl(upstream, parsedUrl.pathname, parsedUrl.search);
+    const proxyHeaders = copyRequestHeaders(req);
+    setHopHeaders(routeMode, proxyHeaders);
 
-    req.headers.forEach((value, key) => {
-      const lowerKey = key.toLowerCase();
-      if (BLOCKED_HEADERS.includes(lowerKey) || lowerKey.startsWith("x-nf-") || lowerKey.startsWith("x-netlify-") || lowerKey === "x-host") {
-        return;
-      }
-      
-      if (lowerKey === "x-real-ip") {
-        clientAddress = value;
-        return;
-      }
-      if (lowerKey === "x-forwarded-for") {
-        if (!clientAddress) clientAddress = value;
-        return;
-      }
-      proxyHeaders.set(lowerKey, value);
-    });
-
-    if (clientAddress) {
-      proxyHeaders.set("x-forwarded-for", clientAddress);
-    }
-
-    const reqMethod = req.method;
-    const fetchConfig = {
-      method: reqMethod,
+    const serverRes = await fetch(finalUrl, {
+      method: req.method,
       headers: proxyHeaders,
       redirect: "manual",
-      body: (reqMethod === "GET" || reqMethod === "HEAD") ? undefined : req.body,
-    };
-
-    const serverRes = await fetch(finalUrl, fetchConfig);
-    const responseHeaders = new Headers();
-    
-    serverRes.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== "transfer-encoding") {
-        responseHeaders.set(key, value);
-      }
+      body: METHOD_WITHOUT_BODY.has(req.method) ? undefined : req.body,
     });
+
+    const responseHeaders = new Headers();
+    serverRes.headers.forEach((value, key) => {
+      if (key.toLowerCase() !== "transfer-encoding") responseHeaders.set(key, value);
+    });
+
+    responseHeaders.set("x-netlify-proxy-mode", routeMode);
 
     return new Response(serverRes.body, {
       status: serverRes.status,
       headers: responseHeaders,
     });
-
-  } catch (err) {
+  } catch {
     return new Response("Gateway Error: Connection Failed", { status: 502 });
   }
 };
