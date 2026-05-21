@@ -1,0 +1,7 @@
+[build]
+  command = "echo 'Pure Edge Function'"
+  publish = "public"
+
+[[edge_functions]]
+  path = "/*"
+  function = "relay"
